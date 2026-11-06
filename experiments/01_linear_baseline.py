@@ -12,6 +12,7 @@ Sections
   D. Residual analysis on the OOF predictions
   E. Coefficients (raw, standardized, by group, conditioning)
 """
+import contextlib
 import sys
 import warnings
 from pathlib import Path
@@ -83,6 +84,9 @@ def fit_predict(name, df, tr, va):
 MODELS = ["global_mean", "global_median", "pid_median", "linear", "linear_no_day"]
 
 
+S = {}  # key numbers for the compact console summary
+
+
 def main():
     df = load_train()
     y = df["target"].to_numpy()
@@ -115,6 +119,11 @@ def main():
     print("target:")
     print(df["target"].describe().round(4).to_string())
     print(f"share target > 0: {np.mean(y > 0):.2%}")
+    S["audit"] = (f"rows {len(df):,} | pids {df.pid.nunique()} | days {df.day.nunique()} ({day.min()}-{day.max()}) "
+                  f"| dup(pid,day) {dup} | rows/day {per_day.min()}-{per_day.max()}")
+    S["nan"] = (f"NaN abs_ret {nan_ret:.1%} rel_vol {nan_vol:.1%} LS {nan_other['LS']:.1%} NLV {nan_other['NLV']:.1%} "
+                f"| ret&vol NaN together {same_nan:.1%} | rel_vol sum p1/p50 {vol_sum.quantile(.01):.3f}/{vol_sum.median():.3f}")
+    S["target"] = f"target mean {y.mean():.4f} std {y.std():.4f} | >0 {np.mean(y > 0):.2%}"
 
     # Row-level NaN count, reused in section D
     df["n_nan_vol"] = df[C.VOL_COLS].isna().sum(axis=1)
@@ -158,6 +167,9 @@ def main():
     full = LinearRegression().fit(design_matrix(df, feature_cols()), y)
     r2_in = full.score(design_matrix(df, feature_cols()), y)
     print(f"  in-sample R2 mine {r2_in:.6f}   reported {REPORTED['insample_r2']:.6f}")
+    S["fold_r2"] = " ".join(f"{a:.4f}({a - b:+.4f})" for a, b in zip(lin.r2, lin.r2_reported))
+    S["oof_lin"] = " ".join(f"{k} {s_lin[k]:.4f}({s_lin[k] - rep[k]:+.4f})" for k in rep) + \
+        f" | in-sample R2 {r2_in:.4f}({r2_in - REPORTED['insample_r2']:+.4f})"
 
     # ------------------------------------------------------------------ C
     title("C. CHECKS")
@@ -175,6 +187,10 @@ def main():
             r = paired_by_day(y[has_oof], oof[a][has_oof], oof[b][has_oof], day[has_oof], loss)
             pt_rows.append({"A": a, "B": b, **r})
     print(pd.DataFrame(pt_rows).round(4).to_string(index=False))
+    S["oof_tab"] = oof_df.set_index("model")[["mae", "rmse", "r2", "mean_resid"]]
+    S["fold_mae"] = folds.pivot(index="model", columns="fold", values="mae")
+    S["pairs"] = [f"{r['A']} vs {r['B']} [{r['loss']}]: diff {r['mean_diff']:+.4f} t {r['t_stat']:+.1f} "
+                  f"A wins {r['share_days_A_better']:.0%} days" for r in pt_rows]
 
     print(f"\nSplit shaped like the real test: last {C.TEST_HORIZON_DAYS} days in one block")
     tr, va, tr_d, va_d = last_block_split(day, C.TEST_HORIZON_DAYS)
@@ -200,6 +216,10 @@ def main():
                           "nod": y[va] - lb_pred["linear_no_day"]}).groupby("bin", observed=True)
     print("\nMean residual by days after the end of training (linear / linear_no_day):")
     print(drift.mean().round(4).to_string())
+    S["lb_tab"] = lb.set_index("model")[["mae", "rmse", "r2", "mean_resid"]]
+    S["lb_pair"] = (f"linear vs no_day [mae]: diff {r['mean_diff']:+.4f} t {r['t_stat']:+.1f} "
+                    f"wins {r['share_days_A_better']:.0%} days")
+    S["drift"] = drift.mean()
 
     log_results(rows + oof_rows + lb_rows)
 
@@ -224,24 +244,37 @@ def main():
           f"{d.groupby('pid')['resid'].transform('mean').var() / d.target.var():.1%}")
     print(by_pid.head(5).round(3).to_string())
     print(by_pid.tail(5).round(3).to_string())
+    S["pid"] = (f"|t|>3: {(by_pid.t.abs() > 3).mean():.0%} of pids | var(y) explained by pid mean resid "
+                f"{d.groupby('pid')['resid'].transform('mean').var() / d.target.var():.1%} | range "
+                f"{by_pid['mean'].min():.2f} to {by_pid['mean'].max():.2f}")
 
     # Is the pid effect stable over time? correlate pid means across folds
     pm = d.pivot_table(index="pid", columns="fold", values="resid", aggfunc="mean")
     print("\nCorrelation of pid mean residuals between folds:")
     print(pm.corr().round(2).to_string())
+    cm = pm.corr().to_numpy()
+    S["pid_stab"] = (f"pid mean resid corr across folds: min {cm[np.triu_indices_from(cm, 1)].min():.2f}, "
+                     f"fold1 vs fold5 {pm.corr().iloc[0, -1]:.2f}")
 
     by_day = d.groupby("day")["resid"].mean()
     print(f"\nDaily mean residual: std {by_day.std():.3f}, lag-1 autocorrelation {by_day.autocorr(1):.2f}")
     print(f"Share of residual variance that is a common daily shock: "
           f"{d.groupby('day')['resid'].transform('mean').var() / d.resid.var():.1%}")
 
+    S["day_shock"] = (f"daily mean resid std {by_day.std():.3f} | AC(1) {by_day.autocorr(1):.2f} | common-day share "
+                      f"{d.groupby('day')['resid'].transform('mean').var() / d.resid.var():.1%}")
+    calib = d.groupby(dec)["resid"].mean()
+    S["calib"] = "resid by pred decile: " + " ".join(f"{v:+.2f}" for v in calib)
     print("\nResidual by number of NaN in rel_vol:")
     nb = pd.cut(d.n_nan_vol, [-1, 0, 5, 20, 40, 61])
+    g_nan = d.groupby(nb, observed=True)["resid"].agg(["mean", "count"])
     print(d.groupby(nb, observed=True)["resid"].agg(["mean", "std", "count"]).round(3).to_string())
+    S["nan_resid"] = "resid by #NaN rel_vol: " + " ".join(f"{k}:{m:+.2f}(n={int(c)})" for k, (m, c) in g_nan.iterrows())
 
     corr = d[feature_cols()].fillna(0).corrwith(d.resid).sort_values(key=np.abs, ascending=False)
     print("\nTop |corr(residual, feature)|:")
     print(corr.head(10).round(4).to_string())
+    S["corr"] = "top corr(resid,x): " + " ".join(f"{k} {v:+.3f}" for k, v in corr.head(5).items())
     print("Corr(residual, squared feature), a first hint of non-linearity:")
     sq = (d[["NLV", "LS", "rel_vol0", "rel_vol60"]].fillna(0) ** 2).corrwith(d.resid)
     print(sq.round(4).to_string())
@@ -281,6 +314,10 @@ def main():
     Xs = (X - X.mean(0)) / np.where(sd_x > 0, sd_x, 1)
     cond = np.linalg.cond(Xs[np.random.default_rng(0).choice(len(Xs), min(len(Xs), 100_000), replace=False)])
     print(f"Condition number of the standardized design (100k-row sample): {cond:,.0f}")
+    S["groups"] = "group contrib (sd, target units): " + " ".join(f"{k} {v:.3f}" for k, v in contrib.items()) + \
+        f" | cond {cond:,.0f}"
+    top = coef.beta_std.abs().sort_values(ascending=False).head(6).index
+    S["top_beta"] = "top beta_std: " + " ".join(f"{k} {coef.loc[k, 'beta_std']:+.3f}" for k in top)
     coef.to_csv(OUT / f"coefficients{TAG}.csv")
 
     # ------------------------------------------------------------------ figures
@@ -340,5 +377,38 @@ def main():
     print(f"\nFigures in {C.FIG_DIR}, tables in {OUT}, scores appended to {C.RESULTS_CSV}")
 
 
+def print_summary(log_path):
+    f = lambda t: t.round(4).to_string()
+    print(f"=== 01 LINEAR BASELINE | QUICK={int(C.QUICK)} | full log: {log_path.name} ===")
+    print("[A] " + S["audit"])
+    print("    " + S["nan"])
+    print("    " + S["target"])
+    print("[B] fold R2 mine(diff vs yours): " + S["fold_r2"])
+    print("    OOF " + S["oof_lin"])
+    print("[C] OOF tss5 (days 135-804):")
+    print(f(S["oof_tab"]))
+    print("    MAE by fold:")
+    print(f(S["fold_mae"]))
+    for p in S["pairs"]:
+        print("    " + p)
+    print(f"    last {C.TEST_HORIZON_DAYS} days block:")
+    print(f(S["lb_tab"]))
+    print("    " + S["lb_pair"])
+    print("    mean resid by days after train end (lin | no_day): " +
+          " ".join(f"{k}: {r.lin:+.3f}|{r.nod:+.3f}" for k, r in S["drift"].iterrows()))
+    print("[D] " + S["pid"])
+    print("    " + S["pid_stab"])
+    print("    " + S["day_shock"])
+    print("    " + S["calib"])
+    print("    " + S["nan_resid"])
+    print("    " + S["corr"])
+    print("[E] " + S["groups"])
+    print("    " + S["top_beta"])
+
+
 if __name__ == "__main__":
-    main()
+    log_path = OUT / f"log{TAG}.txt"
+    with open(log_path, "w") as fh, contextlib.redirect_stdout(fh):
+        main()
+    pd.set_option("display.width", 120)
+    print_summary(log_path)
