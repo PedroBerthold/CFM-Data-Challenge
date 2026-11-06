@@ -16,4 +16,6 @@ Put the challenge files in `data/` (not tracked by git), then from the repo root
 pip install -r requirements.txt
 QUICK=1 python experiments/01_linear_baseline.py   # 60 stocks, all days
 python experiments/01_linear_baseline.py           # full run
+QUICK=1 python experiments/02_cfm_benchmark.py
+python experiments/02_cfm_benchmark.py
 ```
