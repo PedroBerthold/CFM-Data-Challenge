@@ -36,7 +36,7 @@ This is a work in progress. So far I have built the validation framework, audite
 
 `bench_cfm` is my literal reading of the benchmark description: NaN set to 0, a linear fit without the stock id, then LightGBM with default settings on the residuals, stock id included, early stopping with a `TimeSeriesSplit`. The description leaves some choices open (patience, how the fold models are combined), so I call it a literal reading, not an exact reproduction. No official score exists to check it against. Each open choice is written down in [`src/models.py`](src/models.py).
 
-A less literal variant (stock id as a categorical feature, up to 10,000 trees with early stopping, a single refitted model) reaches an MAE of 0.554 on the 5 folds, without leakage. Experiment 03 will isolate which of these changes produces the gain.
+**`bench_cfm` is my reference: MAE 0.592 on the last 347 days.** Every later model is compared to it.
 
 ## What I learned
 
@@ -57,8 +57,8 @@ A less literal variant (stock id as a categorical feature, up to 10,000 trees wi
 
 ## Next steps
 
-1. Ablation of the benchmark: categorical stock id, more trees, a single refitted model, one change at a time.
-2. Model the time trend outside the trees, and test dampened or recent-window trends.
+1. Model the time trend outside the trees, and test dampened or recent-window trends.
+2. Give the model the level of each stock properly (categorical id, or an encoding fitted on training days only).
 3. Cross-sectional daily features to capture the common shock.
 4. Revisit missing returns (0 is correct for volumes, less obvious for returns).
 
