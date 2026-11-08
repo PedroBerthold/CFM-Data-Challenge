@@ -57,10 +57,40 @@ This is a work in progress. So far I have built the validation framework, audite
 
 ## Next steps
 
-1. Model the time trend outside the trees, and test dampened or recent-window trends.
-2. Give the model the level of each stock properly (categorical id, or an encoding fitted on training days only).
-3. Cross-sectional daily features to capture the common shock.
-4. Revisit missing returns (0 is correct for volumes, less obvious for returns).
+The order matters: first make the validation trustworthy, then understand what is left in the residuals, then change the model. Hyperparameter tuning comes last, because tuning a model with the wrong structure optimizes the wrong thing.
+
+**Validation**
+
+| Step | Question | How I test it | What would change my mind |
+|---|---|---|---|
+| Several training end points | How much does the score depend on the training window? (MAE 0.592 on the last 347 days, 0.543 on a 70/30 split, same model) | Train up to days 457, 507, 557, 607, 657, validate on the following days | If model rankings differ across end points, no single split can be trusted |
+
+**Data and residuals**
+
+| Step | Question | How I test it | What would change my mind |
+|---|---|---|---|
+| Noise decomposition | Where is the remaining error: stock level, common daily shock, stock drift over time, or idiosyncratic noise? | Variance decomposition of the `bench_cfm` residuals | If idiosyncratic noise dominates, the ceiling is close and big gains are unlikely |
+| Heteroscedasticity | Does the residual spread vary across stocks, liquidity, predicted value or time? | Ratio of residual standard deviations (90th over 10th percentile) by group; formal tests are useless with 684k rows | A ratio close to 1 means weighting is pointless |
+| Stock-level trends | Is each stock's trend stable, or just noise? | Correlation of per-stock slopes estimated on two separate periods | Low correlation means only a global trend is usable |
+| Extreme days | Are the largest errors concentrated on a few days (index rebalancing, expiries)? | Error by day, and its link with cross-sectional averages of the inputs | If extreme errors are spread across days, they are noise, not events |
+| Missing returns | Is 0 the right fill for missing returns? | Compare 0, a missing-count feature and a "no trade" flag | No validation gain means keep 0 |
+
+**Model**
+
+| Step | Question | How I test it | What would change my mind |
+|---|---|---|---|
+| Trend and level | Can the trend be extrapolated without systematic bias? | Trend handled outside the trees: dampened trend, recent-window level, more weight on recent days | Bias still large across end points |
+| Stock identity | How should each stock's level enter the model? | Categorical id, or an encoding fitted on training days only, with shrinkage toward the global mean | No gain over `bench_cfm` in a paired test |
+| Trees on a detrended target | Do trees add value once the trend is removed and `day` is dropped? | LightGBM on the detrended target with stationary inputs only | Trees beat the linear model only through `day` |
+| Regularized linear model | Does Ridge, Lasso or Elastic Net help? | Same validation as `bench_cfm` | Expected gain near zero (no overfitting at 684k rows), useful mainly for stable coefficients |
+| Hyperparameter tuning | Number of leaves, learning rate, minimum leaf size, number of trees by early stopping | Inner time split only, last training days for early stopping, small search space | A gain smaller than the spread across end points is noise |
+
+**Both data and model**
+
+| Step | Question | How I test it | What would change my mind |
+|---|---|---|---|
+| Daily cross-sectional features | Can the common daily shock be predicted from all stocks' inputs that day? | Daily averages of volume shares and returns across stocks, computed from inputs only, never from the target | No reduction of the common daily component of the residuals |
+| Loss and weights | If residual spread varies, does a robust loss or row weighting help? | L1 or Huber loss; weights inversely related to residual variance | Depends on the official metric: weighting only matters if the spread ratio is large |
 
 ## Repository
 
