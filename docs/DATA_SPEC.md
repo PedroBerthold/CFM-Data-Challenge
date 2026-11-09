@@ -53,7 +53,7 @@ Panel structure:
 | Share of NaN in `LS`, `NLV` | 0% | `[MEAS]` |
 | `abs_ret_n` and `rel_vol_n` missing together | 100% of cases | `[MEAS]` |
 | Row sum of non-missing `rel_vol` | 1.000 (1st percentile and median) | `[MEAS]` |
-| Rows with no NaN in `rel_vol` | about 54% (368k of 684k) | `[MEAS]` |
+| Rows with no NaN in `rel_vol` | 368,326 rows among days 135 to 804 (share on the full train not computed) | `[MEAS]` |
 
 Interpretation `[HYP]`, consistent with all measures: a NaN means no trade in that period. So the true `rel_vol` is 0, and `abs_ret` = 0 (no new price) is the natural value. Interpolation would invent trades and price moves, so it is ruled out. The count and position of missing periods measure illiquidity and are candidate features.
 
@@ -113,4 +113,4 @@ All `[MEAS]`. The same model scores 0.592 or 0.543 depending on the split: absol
 - Public / private test split: by day or by row `[UNKNOWN]`. The best public submission is used for the private ranking by default `[DESC]`.
 - Nature of `LS` and `NLV` `[UNKNOWN]`.
 - Days with very few stocks `[UNKNOWN]`.
-- Leaderboard: best public score 0.3706, ranks 2 to 4 within 0.0007 (0.3857 to 0.3864) `[MEAS]` (on the challenge page, 2026-11-06).
+- Leaderboard: best public score 0.3706, ranks 2 to 4 within 0.0007 (0.3857 to 0.3864), read on the public leaderboard on 2026-11-06. Metric unknown, so not comparable with the validation scores above.
