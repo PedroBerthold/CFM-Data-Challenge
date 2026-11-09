@@ -21,3 +21,10 @@ def last_block_split(day: np.ndarray, horizon: int):
     va_d = udays[-horizon:]
     tr_d = udays[:-horizon]
     return np.isin(day, tr_d), np.isin(day, va_d), tr_d, va_d
+
+
+def origin_split(day: np.ndarray, train_end: int):
+    """Train on days <= train_end, validate on every later day."""
+    udays = np.sort(np.unique(day))
+    tr_d, va_d = udays[udays <= train_end], udays[udays > train_end]
+    return day <= train_end, day > train_end, tr_d, va_d

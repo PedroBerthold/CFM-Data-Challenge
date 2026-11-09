@@ -24,3 +24,7 @@ OTHER_COLS = ["LS", "NLV"]
 
 # Test days are 805..1151, i.e. 347 days right after the training period
 TEST_HORIZON_DAYS = 347
+
+# Training end points for the multi-origin validation (experiment 03)
+ORIGINS = [457, 507, 557, 607, 657]
+HORIZON_BINS = [0, 50, 100, 150, 400]

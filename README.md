@@ -105,6 +105,7 @@ experiments/    one numbered script per experiment
   01_linear_baseline.py   data audit, linear baseline, naive baselines, residual analysis
   02_cfm_benchmark.py     bench_cfm against the linear and per-stock baselines
   02bis_cfm_benchmark_7030.py  same models on a 70/30 time split, to measure the effect of the split
+  03_multi_origin.py      same models over 5 training end points (457 to 657), errors by horizon
 figures/        plots written by the experiments
 results/        results.csv: one row per experiment, model, split and fold
 tests/          synthetic data in the challenge format, to check that scripts run
@@ -118,6 +119,7 @@ QUICK=1 python experiments/01_linear_baseline.py   # 60 stocks, all days, quick 
 python experiments/01_linear_baseline.py
 python experiments/02_cfm_benchmark.py
 python experiments/02bis_cfm_benchmark_7030.py
+python experiments/03_multi_origin.py
 ```
 
 Each script prints a short summary and writes its full output to `results/<experiment>/log.txt`.
