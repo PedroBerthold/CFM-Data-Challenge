@@ -59,6 +59,8 @@ This is a work in progress. So far I have built the validation framework, audite
 
 The order matters: first make the validation trustworthy, then understand what is left in the residuals, then change the model. Hyperparameter tuning comes last, because tuning a model with the wrong structure optimizes the wrong thing.
 
+**Rule: no look-ahead on inputs.** The test file contains the inputs of all test days at once, so a model could use tomorrow's data to predict today's auction. It is allowed by the challenge, but no trader has that information at the close. Every feature for day t only uses inputs from day t or before: rolling windows look backward, never centered or forward. An automated check enforces it.
+
 **Validation**
 
 | Step | Question | How I test it | What would change my mind |
@@ -73,7 +75,10 @@ The order matters: first make the validation trustworthy, then understand what i
 | Heteroscedasticity | Does the residual spread vary across stocks, liquidity, predicted value or time? | Ratio of residual standard deviations (90th over 10th percentile) by group; formal tests are useless with 684k rows | A ratio close to 1 means weighting is pointless |
 | Stock-level trends | Is each stock's trend stable, or just noise? | Correlation of per-stock slopes estimated on two separate periods | Low correlation means only a global trend is usable |
 | Extreme days | Are the largest errors concentrated on a few days (index rebalancing, expiries)? | Error by day, and its link with cross-sectional averages of the inputs | If extreme errors are spread across days, they are noise, not events |
-| Missing returns | Is 0 the right fill for missing returns? | Compare 0, a missing-count feature and a "no trade" flag | No validation gain means keep 0 |
+| Missing values as information | A missing period means no trade, so 0 is the true value and interpolation would invent volume and price moves. Does illiquidity itself predict the auction share? | Number of periods without trades, and where they fall in the day (open, close) | No gain in a paired test |
+| Hidden variables `LS` and `NLV` | Are they stock characteristics (size, liquidity) or daily quantities? | Between-stock versus within-stock variance; correlations with volume, intraday volatility and missing periods | Decides whether to use them raw or relative to each stock's history |
+| Inputs relative to each stock's own distribution | Is today unusual for this stock? Raw levels are not comparable across stocks | Percentile, or distance to the median scaled by the MAD, over a backward rolling window (60 to 250 days) per stock; also the rank across stocks on the same day | Raw inputs do as well in a paired test |
+| Backward rolling features per stock | Does each stock's recent activity help, beyond today's inputs? Past targets cannot be used: the test has none | Rolling statistics of inputs only, per stock, over past days | No gain in a paired test |
 
 **Model**
 
