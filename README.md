@@ -1,125 +1,368 @@
-# Predicting closing auction volumes (CFM Data Challenge #60)
+<p align="center">
+  <img src="figures/banner.png" alt="Closing auction volume forecasting, CFM Data Challenge #60. Pierre Berthold, MSc Paris-Dauphine and ESILV. Public leaderboard MSE 0.355, ranked 1st on 9 Nov 2026." width="100%">
+</p>
 
-I am working on the [CFM challenge](https://challengedata.ens.fr/challenges/60) on Challenge Data (ENS): predict, for 900 stocks and about 350 future days, how much of the day's trading happens in the closing auction.
+<p align="center">
+  <img src="https://img.shields.io/badge/python-3.10+-3987e5?style=flat-square" alt="Python 3.10+">
+  <img src="https://img.shields.io/badge/model-ridge%20+%20LightGBM-3987e5?style=flat-square" alt="Ridge and LightGBM">
+  <img src="https://img.shields.io/badge/validation-3%20forward%20splits-199e70?style=flat-square" alt="Three forward splits">
+  <img src="https://img.shields.io/badge/look--ahead-tested-199e70?style=flat-square" alt="Look-ahead tested">
+  <img src="https://img.shields.io/badge/public%20MSE-0.355-d95926?style=flat-square" alt="Public MSE 0.355">
+</p>
 
-This is a work in progress. So far I have built the validation framework, audited the data, reproduced the official benchmark from its description, and measured where it fails. The goal is not only a leaderboard rank: every change I keep has to win in a validation that looks like the real test.
+<p align="center">
+  <a href="#1-the-problem">Problem</a> ·
+  <a href="#3-the-idea-two-parts">Model</a> ·
+  <a href="#7-no-look-ahead">Look-ahead</a> ·
+  <a href="#8-how-everything-was-validated">Validation</a> ·
+  <a href="#10-limits">Limits</a> ·
+  <a href="#11-run-it">Run it</a> ·
+  <a href="#glossary">Glossary</a>
+</p>
 
-## The problem
+For 900 stocks and 347 future days, predict how much of the day's trading happens in the closing auction. The challenge is set by CFM and hosted by [Challenge Data ENS](https://challengedata.ens.fr/challenges/60).
 
-**Target.** `log(closing auction volume / volume traded over the 61 intraday periods)`, one value per stock and day. The median auction share is about 14% of the intraday volume.
+The model is a sum of two simple parts, each validated on its own: **what the whole market does that day**, plus **where a stock sits relative to the others**. Most of the work is in the validation, not in the model.
 
-**Why it is predictable.** The closing auction is the cheapest place to trade and the last chance of the day. Market makers and day traders use it to go flat before the overnight risk; asset managers use it to reach their end-of-day target position, and index funds trade at the close because they are benchmarked to the closing price. These flows are persistent by stock and partly visible in the intraday activity of the same day.
+| | Score (MSE, lower is better) |
+|---|---|
+| **Public leaderboard** | **0.3550**, ranked 1st when submitted (9 Nov 2026) |
+| Validation, same model | 0.333 (0.309 to 0.360 depending on the split) |
+| Reference built from the benchmark description, same validation | 0.525 |
 
-**Data.**
-- 684,482 training rows (days 0 to 804) and 311,744 test rows (days 805 to 1151), same 900 stocks.
-- Per row: 61 intraday absolute returns, 61 intraday volume shares, and two undisclosed variables (`LS`, `NLV`).
-- The test days all come after the training days, so the task is forecasting under drift, not interpolation.
+> [!TIP]
+> New to some of the vocabulary? The [glossary](#glossary) explains each term in two lines, including what a t-statistic is and why it is used here.
 
-## How I validate
+<details>
+<summary><b>Table of contents</b></summary>
 
-- **Splits by day, never by row.** I use two splits:
-  - 5 expanding folds on unique days (`TimeSeriesSplit`), validation on days 135 to 804;
-  - one block shaped like the real test: train on days 0 to 457, validate on the last 347 days. This is my main yardstick.
-- **The unit of evidence is the day, not the row.** Stocks on the same day share market shocks, so 684k rows are far from 684k independent observations. Models are compared through paired tests on the daily mean loss, with a Newey-West standard error because consecutive days are correlated.
-- **Rule for keeping a change.** It must win on most folds and in a significant paired test. Models are chosen in validation, never on the public leaderboard.
-- **No leakage.** Anything fitted on the target (medians, the linear stage, the boosted trees, early stopping) only sees training days. The official metric is not stated in the description I have, so I report both MAE and MSE.
+**Part I. The problem and the data**
+1. [The problem](#1-the-problem)
+2. [What the data look like](#2-what-the-data-look-like)
 
-## Results so far
+**Part II. The model**
 
-| Model | MAE, last 347 days | RMSE, last 347 days | MAE, 5 folds | Mean bias, last 347 days |
+3. [The idea: two parts](#3-the-idea-two-parts)
+4. [Part 1: the day effect](#4-part-1-the-day-effect)
+5. [Part 2: the stock effect](#5-part-2-the-stock-effect)
+6. [Hyperparameters and regularization](#6-hyperparameters-and-regularization)
+
+**Part III. The evidence**
+
+7. [No look-ahead](#7-no-look-ahead)
+8. [How everything was validated](#8-how-everything-was-validated)
+9. [What did not work](#9-what-did-not-work)
+10. [Limits](#10-limits)
+
+**Part IV. Run it and vocabulary**
+
+11. [Run it](#11-run-it)
+12. [Glossary](#glossary)
+
+</details>
+
+<p align="center"><img src="figures/part_1.png" alt="Part I. The problem and the data" width="100%"></p>
+
+## 1. The problem
+
+**Target.** One number per stock and per day:
+
+```
+target = log( closing auction volume / volume traded during the day's 61 intraday periods )
+```
+
+A target of -2 means the auction is worth about 14% of the intraday volume. A target above 0 means the auction was larger than the whole intraday session.
+
+> [!IMPORTANT]
+> **Why it is hard.** All 347 test days come after the 805 training days. The model never sees a target from the test period, and the organizer warns that auction volumes grow over time. This is forecasting under drift, not filling gaps.
+
+**Inputs.** Per stock and day: 61 absolute returns, 61 volume shares (one per intraday period), and two undisclosed variables, `LS` and `NLV`.
+
+## 2. What the data look like
+
+Four measured facts drive every design choice below.
+
+**Fact 1. A missing period means "no trade".** A return and a volume share are always missing together, and the remaining volume shares still sum to 1. Missing values are therefore set to 0 (no volume, no price move) and never interpolated. The number of empty periods is kept as a feature: it measures how illiquid the stock was that day.
+
+**Fact 2. The whole market moves together on some days.** On a few days per quarter, every stock trades far more at the close than usual. The slow level also rises over time.
+
+![Daily mean of the target](figures/01_target_over_time.png)
+
+**Fact 3. The variance has three sources**, and they call for different tools.
+
+![Variance split](figures/02_variance_split.png)
+
+**Fact 4. `NLV` behaves like the day's intraday volume.** For a given stock, a day with a high `NLV` has a lower target, with a slope between -0.75 and -0.8. This makes sense: the intraday volume is the denominator of the target. "How unusual is today's volume for this stock" is the strongest same-day signal.
+
+![Volume effect](figures/03_volume_effect.png)
+
+<p align="center"><img src="figures/part_2.png" alt="Part II. The model" width="100%"></p>
+
+## 3. The idea: two parts
+
+```mermaid
+flowchart LR
+    A[Inputs of all stocks<br/>on day t] --> B[Day effect<br/>ridge regression<br/>one value per day]
+    C[Inputs of one stock<br/>on day t and before] --> D[Stock effect<br/>gradient boosting<br/>one value per stock and day]
+    E[Targets of the<br/>training days] --> B
+    E --> D
+    B --> F((sum))
+    D --> F
+    F --> G[Prediction]
+```
+
+```
+prediction(stock, day) = day effect(day) + stock effect(stock, day)
+```
+
+Why split? A single model fed with everything has to learn two very different things at once: a time series with 805 points (the day effect) and a cross-section with 684,482 rows (the stock effect). Boosted trees are good at the second and bad at the first, because a tree cannot extrapolate a trend: for any future day it reuses the level of the last training days. Splitting lets each part use the right tool and be validated separately.
+
+> [!NOTE]
+> The stock model is trained on `target - mean target of the day`, so it only ever learns differences between stocks.
+
+## 4. Part 1: the day effect
+
+**What it predicts.** The mean target of the day over all stocks.
+
+**Model.** A ridge regression fitted on the training days, with 18 day-level features:
+
+| Family | Count | What it captures |
+|---|---|---|
+| Event-day and day-type indicators | 14 | Recurring days on which the entire market trades more at the close. The largest are worth +0.7 to +1.7 on the daily mean. |
+| Half-session flag and its interaction | 2 | Days where a third of the periods have no trades at all. |
+| Market-wide activity | 2 | Average volume and average volatility of the day, compared with the previous 20 days. |
+
+This README does not document how the event-day indicators are built.
+
+**The slow level.** Before fitting, the slow level of the series is removed with a 41-day centered median over ordinary days, so that the regression only explains deviations from it. In the test period the level is unknown and has to be extrapolated:
+
+- anchor: average level of the last 60 training days;
+- slope: slope of the level over the whole training history.
+
+![Level extrapolation](figures/07_level_extrapolation.png)
+
+**How it was validated.** MSE of the predicted day effect against the true daily mean, on the three splits of section 8:
+
+| Day model | Split A | Split B | Split C | Mean |
 |---|---|---|---|---|
-| Global median | 0.707 | 0.911 | 0.699 | +0.28 |
-| Median per stock | 0.626 | 0.838 | 0.581 | +0.37 |
-| Linear regression, no `day` | 0.639 | 0.831 | 0.638 | +0.28 |
-| Linear regression (CFM stage 1) | 0.610 | 0.795 | 0.620 | -0.17 |
-| **bench_cfm** (linear + LightGBM on residuals) | **0.592** | **0.764** | **0.585** | -0.21 |
+| Constant (training mean) | 0.197 | 0.205 | 0.195 | 0.199 |
+| Same-day inputs only, no event-day indicators | 0.112 | 0.076 | 0.075 | 0.088 |
+| **Full day model** | **0.059** | **0.041** | **0.025** | **0.042** |
 
-`bench_cfm` is my literal reading of the benchmark description: NaN set to 0, a linear fit without the stock id, then LightGBM with default settings on the residuals, stock id included, early stopping with a `TimeSeriesSplit`. The description leaves some choices open (patience, how the fold models are combined), so I call it a literal reading, not an exact reproduction. No official score exists to check it against. Each open choice is written down in [`src/models.py`](src/models.py).
+## 5. Part 2: the stock effect
 
-**`bench_cfm` is my reference: MAE 0.592 on the last 347 days.** Every later model is compared to it.
+**What it predicts.** `target - day mean`: where the stock sits relative to the other stocks of the same day.
 
-## What I learned
+**Model.** LightGBM (boosted decision trees) on 157 features, none of which is the day index or the stock identifier. Both are left out on purpose: the day index cannot be extrapolated by trees, and a stock identifier lets the model memorize instead of learning from the stock's measurable behaviour.
 
-1. **Missing values mean "no trade", so 0 is the right fill for volumes.** The return and the volume of a period are always missing together, and the remaining volume shares still sum to exactly 1. Setting missing volume shares to 0 is therefore correct, not just a convention.
-2. **Per-period volume coefficients are meaningless one by one.** The 61 shares sum to 1, so they are exactly collinear with the intercept (condition number around 10^18). Predictions are fine, but I only interpret these coefficients as a group or as an intraday profile.
-3. **The choice of validation flips the ranking of models.** On the 5 folds, the per-stock median beats the linear model (MAE 0.581 against 0.620). On the 347-day block, it is the reverse (0.626 against 0.610). Early folds train on only 135 days and reward static models; the block that looks like the test rewards models that follow the trend. I would have picked the wrong baseline with a standard time-series CV.
-4. **Auction shares grow over time, and every model gets the level wrong.** Without a time trend, models underpredict more and more (+0.16 to +0.34 by horizon). With a linear trend in `day`, they overpredict (-0.12 to -0.23): the trend is real but slower than a straight line.
-5. **Trees cannot extrapolate time.** In `bench_cfm`, `day` takes 28% of the boosting gain, but a tree just reuses the residual level of the last training days for any future day. It makes the bias worse (-0.21 against -0.17 for the linear stage alone).
-6. **The stock effect is large but underused.** The mean residual per stock explains 23.5% of the target variance, and its correlation from one fold to another is about 0.8: stable, but drifting. Passed as a plain integer, the stock id only gets 12% of the boosting gain.
-7. **A common daily shock is left in the residuals.** 15% of the residual variance is a shock shared by all stocks on the same day, which no model captures yet. My hypothesis is index rebalancing and expiry days. Test-day features of all stocks are available, so cross-sectional daily aggregates of the inputs can be used without leakage.
+### Features, family by family
 
-## Open questions and doubts
+Each family was added in turn and kept only if it lowered the validation error.
 
-- **Metric.** The description I have does not name it. I track MAE and MSE until it is confirmed.
-- **Public and private test split.** I do not know yet whether it is by day or by row. By default, the best public submission is used for the private ranking, which rewards overfitting the public test. I will submit rarely, and only models already selected in validation.
-- **Unequal days.** Some days have only 16 stocks instead of 900. I have not checked yet which days they are and why.
-- **`bench_cfm` may be slightly pessimistic.** A third of its inner models hit the default cap of 100 trees, and averaging them with near-empty models from early folds probably costs some accuracy.
+![Feature ladder](figures/06_feature_ladder.png)
 
-## Next steps
+| Step | Family | Idea in one line |
+|---|---|---|
+| 1 | Same-day summaries (34) | Compress the 61 periods: volume at the open and near the close, concentration, timing, volatility, number of empty periods. |
+| 2 | Stock target levels (6) | The stock's average target over its last 20, 60, 250 days and its whole history, as known on a past date (see below). |
+| 3 | Distance to own past (56) | Today's `NLV`, `LS`, volatility and volume profile minus the stock's own average over the previous 5, 20 and 60 days. |
+| 4 | Position in the day (14) | The same quantities minus the day's average over all stocks, and as a rank within the day. |
+| 5 | Event-day information (12) | Day-type flags, and the stock's usual behaviour on event days. |
+| 6 | Long windows (20) | Distances to the stock's average over 120 and 250 days, and over all its past. |
+| 7 | Matched gaps (15) | Today's inputs minus the stock's inputs over the exact window used for its target level, and the combination `level - 0.8 x volume gap`. |
 
-The order matters: first make the validation trustworthy, then understand what is left in the residuals, then change the model. Hyperparameter tuning comes last, because tuning a model with the wrong structure optimizes the wrong thing.
+Step 7 hands the trees a ready-made version of fact 4. Trees approximate a sum of two features poorly; giving them the sum directly is cheap and ends up as the most used feature.
 
-**Rule: no look-ahead on inputs.** The test file contains the inputs of all test days at once, so a model could use tomorrow's data to predict today's auction. It is allowed by the challenge, but no trader has that information at the close. Every feature for day t only uses inputs from day t or before: rolling windows look backward, never centered or forward. An automated check enforces it.
+![Feature importance](figures/09_feature_importance.png)
 
-**Validation**
+### Stale stock levels: training the way the model will be used
 
-| Step | Question | How I test it | What would change my mind |
+In the test, the last known target of a stock is at day 804, and the model has to predict up to 347 days later. The stock's "usual level" is therefore between 1 and 347 days old when it is used.
+
+If the model were trained with levels computed up to the previous day, it would learn to trust them fully, and then be wrong in the test, where they are old.
+
+> [!NOTE]
+> Each training row gets its stock levels **as of a past day `t - h`, with `h` drawn at random between 1 and 347**, and `h` is given as a feature. The model learns how much to trust a level depending on its age.
+
+| Stock levels in training | Split A | Split B | Split C |
 |---|---|---|---|
-| Several training end points | How much does the score depend on the training window? (MAE 0.592 on the last 347 days, 0.543 on a 70/30 split, same model) | Train up to days 457, 507, 557, 607, 657, validate on the following days | If model rankings differ across end points, no single split can be trusted |
+| As of the previous day | 0.3110 | 0.3037 | 0.2893 |
+| **As of a random past day (kept)** | **0.3094** | **0.2962** | **0.2844** |
 
-**Data and residuals**
+(MSE of the stock part, 120-stock extract, squared loss.)
 
-| Step | Question | How I test it | What would change my mind |
+### Two losses, then a re-centring
+
+- Two models are trained on the same features, one minimizing the squared error and one the absolute error, and their predictions are averaged. The absolute error is less sensitive to the extreme days. On 900 stocks the average scores 0.2912 against 0.2914 and 0.2942 for the two models alone, and it has the best MAE as well.
+- Predictions are shifted so that their mean is zero on each day. The training target has a zero mean per day by construction, so any non-zero daily mean in the predictions is pure error. Gain: 0.2943 to 0.2912.
+
+## 6. Hyperparameters and regularization
+
+No hyperparameter search was run. The values below are standard, fixed in advance, and only checked against a few alternatives (section 9). With 805 days of history, a long search would mostly fit the validation periods.
+
+| Where | Setting | Value | Role |
 |---|---|---|---|
-| Noise decomposition | Where is the remaining error: stock level, common daily shock, stock drift over time, or idiosyncratic noise? | Variance decomposition of the `bench_cfm` residuals | If idiosyncratic noise dominates, the ceiling is close and big gains are unlikely |
-| Heteroscedasticity | Does the residual spread vary across stocks, liquidity, predicted value or time? | Ratio of residual standard deviations (90th over 10th percentile) by group; formal tests are useless with 684k rows | A ratio close to 1 means weighting is pointless |
-| Stock-level trends | Is each stock's trend stable, or just noise? | Correlation of per-stock slopes estimated on two separate periods | Low correlation means only a global trend is usable |
-| Extreme days | Are the largest errors concentrated on a few days (index rebalancing, expiries)? | Error by day, and its link with cross-sectional averages of the inputs | If extreme errors are spread across days, they are noise, not events |
-| Missing values as information | A missing period means no trade, so 0 is the true value and interpolation would invent volume and price moves. Does illiquidity itself predict the auction share? | Number of periods without trades, and where they fall in the day (open, close) | No gain in a paired test |
-| Hidden variables `LS` and `NLV` | Are they stock characteristics (size, liquidity) or daily quantities? | Between-stock versus within-stock variance; correlations with volume, intraday volatility and missing periods | Decides whether to use them raw or relative to each stock's history |
-| Inputs relative to each stock's own distribution | Is today unusual for this stock? Raw levels are not comparable across stocks | Percentile, or distance to the median scaled by the MAD, over a backward rolling window (60 to 250 days) per stock; also the rank across stocks on the same day | Raw inputs do as well in a paired test |
-| Backward rolling features per stock | Does each stock's recent activity help, beyond today's inputs? Past targets cannot be used: the test has none | Rolling statistics of inputs only, per stock, over past days | No gain in a paired test |
+| Stock model | Learning rate | 0.05 | Small steps, each tree corrects a little. |
+| | Number of trees | 900 | Chosen among 300, 600, 900 on validation (0.2925, 0.2912, 0.2911). |
+| | Leaves per tree | 63 | Complexity of one tree. |
+| | Minimum rows per leaf | 100 | A rule must hold for at least 100 stock-days. |
+| | Rows used per tree | 80% | Each tree sees a random subset of rows. |
+| | Features used per tree | 50% | Each tree sees a random half of the features. |
+| | L2 penalty on leaf values | 5 | Pulls leaf predictions towards zero. |
+| | Losses averaged | squared, absolute | Robustness to extreme days. |
+| | Random seeds averaged | 3 | Averages out the randomness of the draws. |
+| Stock levels | Shrinkage | sum / (n + 5) | A level based on few days is pulled towards zero. |
+| Day model | Ridge penalty | 1.0, on standardized features | Keeps the 18 coefficients stable with about 780 days. |
+| | Detrending window | 41 days | Centered median over ordinary days. |
+| | Level anchor | last 60 training days | Starting point of the extrapolation. |
 
-**Model**
+**Regularization in plain words.** Every setting above limits how closely the model can follow the training data. The structural choices do the same job: no day index, no stock identifier, two losses, three seeds, and a zero mean per day.
 
-| Step | Question | How I test it | What would change my mind |
-|---|---|---|---|
-| Trend and level | Can the trend be extrapolated without systematic bias? | Trend handled outside the trees: dampened trend, recent-window level, more weight on recent days | Bias still large across end points |
-| Stock identity | How should each stock's level enter the model? | Categorical id, or an encoding fitted on training days only, with shrinkage toward the global mean | No gain over `bench_cfm` in a paired test |
-| Trees on a detrended target | Do trees add value once the trend is removed and `day` is dropped? | LightGBM on the detrended target with stationary inputs only | Trees beat the linear model only through `day` |
-| Regularized linear model | Does Ridge, Lasso or Elastic Net help? | Same validation as `bench_cfm` | Expected gain near zero (no overfitting at 684k rows), useful mainly for stable coefficients |
-| Hyperparameter tuning | Number of leaves, learning rate, minimum leaf size, number of trees by early stopping | Inner time split only, last training days for early stopping, small search space | A gain smaller than the spread across end points is noise |
+<p align="center"><img src="figures/part_3.png" alt="Part III. The evidence" width="100%"></p>
 
-**Both data and model**
+## 7. No look-ahead
 
-| Step | Question | How I test it | What would change my mind |
-|---|---|---|---|
-| Daily cross-sectional features | Can the common daily shock be predicted from all stocks' inputs that day? | Daily averages of volume shares and returns across stocks, computed from inputs only, never from the target | No reduction of the common daily component of the residuals |
-| Loss and weights | If residual spread varies, does a robust loss or row weighting help? | L1 or Huber loss; weights inversely related to residual variance | Depends on the official metric: weighting only matters if the spread ratio is large |
+The test file contains all 347 test days at once, so it would be technically possible to use the inputs of day `t+1` to predict day `t`. This project forbids it.
 
-## Repository
+**Rules.**
 
-```
-src/            data loading, time splits, metrics and paired tests, models, logging
-experiments/    one numbered script per experiment
-  01_linear_baseline.py   data audit, linear baseline, naive baselines, residual analysis
-  02_cfm_benchmark.py     bench_cfm against the linear and per-stock baselines
-  02bis_cfm_benchmark_7030.py  same models on a 70/30 time split, to measure the effect of the split
-  03_multi_origin.py      same models over 5 training end points (457 to 657), errors by horizon
-figures/        plots written by the experiments
-results/        results.csv: one row per experiment, model, split and fold
-tests/          synthetic data in the challenge format, to check that scripts run
-```
+1. A feature of day `t` uses inputs of day `t` or earlier only.
+2. Same-day statistics across stocks are allowed, for inputs only.
+3. Anything computed from the target only reads targets up to an explicit "as-of" day, which is never later than the last training day.
+4. Everything fitted (ridge, trees, slopes, number of trees) is fitted on training days.
 
-Put the challenge files in `data/` (not tracked), then from the repo root:
+**Automated checks** ([`tests/test_no_lookahead.py`](tests/test_no_lookahead.py)). The features are built twice: on the full data, and on a copy where the future is deleted or replaced by noise. The past must come out identical.
+
+| Check | Result |
+|---|---|
+| 124 input features, days after day 600 deleted | identical on days up to 600 |
+| 24 target-based features, targets after the as-of day replaced by noise | identical |
+| Day model fitted up to day 600, later targets replaced by a constant | identical predictions |
+
+**What the rule costs.** Relaxing rule 1 (windows centred on the day, averages over the whole sample) was tested on the 120-stock extract and gave no gain: MSE 0.3108 / 0.2948 / 0.2841 on the three splits, against 0.3094 / 0.2962 / 0.2844 for the strict version. The strict version is the one submitted.
+
+## 8. How everything was validated
+
+**Splits copy the real task.** Train on days 0 to T, predict the following days, for three values of T. Splitting rows at random would let the model see the future of each stock and give scores that mean nothing for the test.
+
+![Validation scheme](figures/04_validation_scheme.png)
+
+**References built from scratch**, scored on the same splits: the per-stock mean, a linear model on the raw inputs, and the structure of the official benchmark (linear model, then boosted trees on its residuals).
+
+![Model ladder](figures/05_model_ladder.png)
+
+| Model, 900 stocks | Split A | Split B | Split C | Mean MSE | Mean MAE |
+|---|---|---|---|---|---|
+| Per-stock mean | 0.653 | 0.644 | 0.631 | 0.643 | 0.597 |
+| Linear on raw inputs | 0.632 | 0.588 | 0.587 | 0.602 | 0.592 |
+| Reference: linear + boosted residuals | 0.551 | 0.520 | 0.503 | 0.525 | 0.556 |
+| Two-part model, no event-day flags | 0.413 | 0.364 | 0.359 | 0.379 | 0.452 |
+| **Two-part model (final)** | **0.360** | **0.330** | **0.309** | **0.333** | **0.425** |
+| Stock part alone, true day effect given | 0.301 | 0.289 | 0.284 | 0.291 | 0.399 |
+
+The last row is not a model that can be submitted. It shows the floor of this design: 0.291 if the day effect were known exactly. The gap to 0.333 is what the day model still gets wrong.
+
+**Is the gain real or luck?** Rows of the same day are not independent: they share the day's market move. The unit of evidence is therefore the day, not the row. For each validation day, the loss of the final model minus the loss of the reference is computed, and the mean of these daily differences is tested (see [t-statistic](#glossary)).
+
+| Split | Days | Mean MSE difference | t-statistic | Days where the final model wins |
+|---|---|---|---|---|
+| A | 347 | -0.192 | -14.5 | 92% |
+| B | 247 | -0.191 | -11.6 | 99.6% |
+| C | 147 | -0.195 | -10.0 | 99.3% |
+
+**The error by horizon.** The further from the last training day, the larger the error, as expected: stock levels get stale and the market level drifts.
+
+![Error by horizon](figures/08_error_by_horizon.png)
+
+> [!NOTE]
+> **Out of sample.** The public leaderboard score, 0.3550, falls inside the validation range (0.309 to 0.360). The validation was honest about what to expect.
+
+## 9. What did not work
+
+Tested on the same splits and dropped. Scores are the MSE of the stock part on the 120-stock extract (squared loss, mean of the three splits).
+
+| Idea | Result |
+|---|---|
+| Giving the trees the 122 raw columns next to the summaries | No gain. |
+| Windows centred on the day, whole-sample stock averages (look-ahead) | No gain: mean 0.2966 against 0.2967. |
+| Stock identifier as a categorical feature | No gain. |
+| Larger trees (127 leaves, 50 rows per leaf) | Worse: 0.2993 against 0.2967. |
+| Smaller trees (31 leaves, 900 of them) | Slightly worse: 0.2976 against 0.2967. |
+| More windows for the stock levels (120 and 500 days) | No gain: 0.2967 against 0.2967. |
+| Stock levels as of the previous day | Worse on all three splits (section 5). |
+| More day-level activity features | Gain below 0.002, not kept. |
+
+## 10. Limits
+
+> [!WARNING]
+> The first limit is the one that matters most for the final ranking.
+
+- **The level of the test period cannot be learned from the training data.** With the slope of the whole history, the predicted level was too low by 0.16 and 0.12 on splits A and B, and right on split C. Two other submission files are written with a flat level and with twice the slope. Only the main one was submitted.
+- **Three splits are not three independent experiments.** They overlap, and the history contains a single episode of rising auction shares.
+- **Feature families were screened on a 120-stock extract**, then the complete pipeline was confirmed on the 900 stocks.
+- **`LS` is used without knowing what it is.**
+- **The public leaderboard covers part of the test set.** The private ranking may differ.
+
+<p align="center"><img src="figures/part_4.png" alt="Part IV. Run it and vocabulary" width="100%"></p>
+
+## 11. Run it
 
 ```bash
 pip install -r requirements.txt
-QUICK=1 python experiments/01_linear_baseline.py   # 60 stocks, all days, quick check
-python experiments/01_linear_baseline.py
-python experiments/02_cfm_benchmark.py
-python experiments/02bis_cfm_benchmark_7030.py
-python experiments/03_multi_origin.py
+# put input_training.csv.gz, output_training_IxKGwDV.csv and input_test.csv.gz in data/
+python experiments/04_pipeline.py        # validation, final fit, submission files
+python tests/test_no_lookahead.py        # look-ahead checks
+python experiments/05_figures.py         # figures of this README (needs data/sample/)
 ```
 
-Each script prints a short summary and writes its full output to `results/<experiment>/log.txt`.
+| Path | Content |
+|---|---|
+| [`src/features.py`](src/features.py) | Stock-day features and target levels as of a given day |
+| [`src/daymodel.py`](src/daymodel.py) | Day effect: ridge regression and level extrapolation |
+| [`src/stockmodel.py`](src/stockmodel.py) | Stock effect: LightGBM, two losses, several seeds |
+| [`src/metrics.py`](src/metrics.py) | Scores and paired tests by day |
+| [`experiments/04_pipeline.py`](experiments/04_pipeline.py) | The whole pipeline, from the CSV files to the submission |
+| [`experiments/01` to `03`](experiments/) | Earlier work: data audit, residual analysis, validation over several training ends |
+| [`tests/`](tests/) | Synthetic data generator and look-ahead checks |
+
+## Glossary
+
+**Closing auction.** The last trade of the day. All orders are matched at a single price, which becomes the official closing price.
+
+**Target.** The quantity to predict: `log(auction volume / intraday volume)`.
+
+**MSE, MAE.** Mean squared error and mean absolute error between predictions and true values. Lower is better. MSE punishes large errors more.
+
+**Training end, horizon.** The training end is the last day whose target the model may see. The horizon is the number of days between that day and the day being predicted.
+
+**Look-ahead (leakage).** Using information that would not be available at prediction time. It makes validation scores look better than what the model will really do.
+
+**Cross-section.** All the stocks on one given day.
+
+**Day effect, stock effect.** The part of the target shared by all stocks on a day, and the part specific to one stock on that day.
+
+**Ridge regression.** A linear regression with a penalty on large coefficients, which keeps them stable when there are few observations.
+
+**Gradient boosting, LightGBM.** Many small decision trees fitted one after the other, each correcting the errors of the previous ones. LightGBM is a fast implementation.
+
+**Regularization.** Anything that stops a model from following the training data too closely: penalties, minimum leaf sizes, subsampling, averaging.
+
+**Shrinkage.** Pulling an estimate towards a neutral value when it is based on few observations.
+
+**Loss.** What a model minimizes during training: the squared error (L2) or the absolute error (L1).
+
+**Seed.** The starting point of the random numbers. Averaging models trained with different seeds removes part of the randomness.
+
+**As-of level.** A stock's average target computed only with the days up to a given date.
+
+**Ablation.** Removing or adding one component at a time to measure what it contributes.
+
+**Extrapolation.** Predicting outside the range seen in training, here beyond the last training day.
+
+**Paired test.** Comparing two models on the same days by testing the mean of their daily loss differences. Pairing removes what both models share, such as a hard day.
+
+**t-statistic.** `t = mean difference / standard error of that mean`. It says how many standard errors the observed gap is away from zero. An absolute value above about 2 means the gap is unlikely to be luck.
+
+*Why a t-statistic and not a z-score.* The two share the same formula. A z-score assumes the true standard deviation of the daily differences is known. Here it is not: it is estimated from the same 147 to 347 days, and that estimate is itself uncertain. A ratio built on an estimated standard deviation is a t-statistic, and it is read against Student's t distribution, which has slightly heavier tails than the normal to account for that extra uncertainty. With this many days the two distributions are almost identical, so the choice changes the name more than the conclusion.
+
+**Newey-West standard error.** The usual standard error assumes the daily differences are independent. They are not: a good day is often followed by another. The Newey-West formula widens the standard error to account for the correlation between nearby days (10 lags here), which makes the t-statistics smaller and more honest.

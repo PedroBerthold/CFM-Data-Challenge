@@ -13,7 +13,7 @@ import pandas as pd
 out = Path(sys.argv[1] if len(sys.argv) > 1 else "fake_data")
 out.mkdir(parents=True, exist_ok=True)
 rng = np.random.default_rng(1)
-n_pid, n_day, P = 120, 805, 61
+n_pid, n_train_day, n_day, P = 120, 805, 1152, 61
 
 pid = np.repeat(np.arange(n_pid), n_day)
 day = np.tile(np.arange(n_day), n_pid)
@@ -40,7 +40,9 @@ X = pd.DataFrame({"ID": ids, "pid": pid, "day": day})
 X = pd.concat([X, pd.DataFrame(ret, columns=[f"abs_ret{i}" for i in range(P)]),
                pd.DataFrame(vol, columns=[f"rel_vol{i}" for i in range(P)])], axis=1)
 X["LS"], X["NLV"] = ls, nlv
-X.to_csv(out / "input_training.csv.gz", index=False)
-pd.DataFrame({"ID": ids, "target": target}).sample(frac=1, random_state=0).to_csv(
+is_tr = (X["day"] < n_train_day).to_numpy()
+X[is_tr].to_csv(out / "input_training.csv.gz", index=False)
+X[~is_tr].sample(frac=1, random_state=1).to_csv(out / "input_test.csv.gz", index=False)
+pd.DataFrame({"ID": ids[is_tr], "target": target[is_tr]}).sample(frac=1, random_state=0).to_csv(
     out / "output_training_IxKGwDV.csv", index=False)
-print(f"wrote {n} rows to {out}")
+print(f"wrote {is_tr.sum()} training rows and {(~is_tr).sum()} test rows to {out}")
